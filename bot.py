@@ -37,7 +37,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 # Auto-detect which provider to use based on which key is set
 if OPENAI_API_KEY:
     LLM_PROVIDER  = "openai"
-    COMPOSE_MODEL = "gpt-4o"
+    COMPOSE_MODEL = "gpt-4o-mini"
     FAST_MODEL    = "gpt-4o-mini"
 else:
     LLM_PROVIDER  = "anthropic"
