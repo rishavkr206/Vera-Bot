@@ -74,6 +74,9 @@ suppression_log: dict[str, str] = {}
 # conversation_id → last sent body (for anti-repetition)
 sent_bodies: dict[str, list[str]] = {}
 
+# conversation_id → count of auto-reply detections (end after 2)
+auto_reply_counts: dict[str, int] = {}
+
 START_TIME = time.time()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -168,8 +171,34 @@ async def tick(body: TickBody):
     for trg_id in body.available_triggers:
         trg_entry = context_store.get(("trigger", trg_id))
         if not trg_entry:
-            continue
-        trg = trg_entry["payload"]
+            # Trigger not pre-loaded — infer kind from ID and compose anyway
+            # Extract kind from trigger ID (e.g. trg_001_research_digest_dentists -> research_digest)
+            kind_guess = "generic"
+            for k in ["research_digest", "recall_due", "perf_dip", "perf_spike",
+                      "renewal_due", "seasonal_perf_dip", "dormant_with_vera",
+                      "customer_lapsed", "chronic_refill_due", "trial_followup",
+                      "competitor_opened", "festival_upcoming", "ipl_match",
+                      "review_theme", "milestone_reached", "supply_alert",
+                      "regulation_change", "gbp_unverified", "winback"]:
+                if k.replace("_", "") in trg_id.replace("_", "").lower():
+                    kind_guess = k
+                    break
+            # Try to find any merchant in the store to compose for
+            merchant_ids = [ctx_id for (scope, ctx_id) in context_store if scope == "merchant"]
+            if not merchant_ids:
+                log.info(f"No merchant context available, skipping {trg_id}")
+                continue
+            # Build minimal trigger payload
+            trg = {
+                "id": trg_id, "kind": kind_guess, "scope": "merchant",
+                "source": "internal", "merchant_id": merchant_ids[0],
+                "customer_id": None, "urgency": 2,
+                "suppression_key": f"{kind_guess}:{trg_id}",
+                "expires_at": None, "payload": {"metric_or_topic": kind_guess}
+            }
+            log.info(f"Built minimal trigger for {trg_id} kind={kind_guess}")
+        else:
+            trg = trg_entry["payload"]
 
         # Check suppression
         sup_key = trg.get("suppression_key", "")
@@ -301,7 +330,17 @@ async def reply(body: ReplyBody):
 
     # Detect auto-reply first (fast path — no LLM)
     if is_auto_reply(message):
-        log.info(f"Auto-reply detected in conv {conv_id}")
+        count = auto_reply_counts.get(conv_id, 0) + 1
+        auto_reply_counts[conv_id] = count
+        log.info(f"Auto-reply detected in conv {conv_id} count={count}")
+        if count >= 2:
+            # End conversation after 2 auto-replies
+            if conv_id in conv_meta:
+                conv_meta[conv_id]["state"] = "closed"
+            return {
+                "action": "end",
+                "rationale": "Repeated auto-reply detected; ending conversation to avoid loop"
+            }
         return {
             "action": "wait",
             "wait_seconds": 1800,
@@ -321,6 +360,7 @@ async def reply(body: ReplyBody):
         }
 
     # Get full context for LLM reply
+    is_customer_message = (from_role == "customer")
     merchant_entry = context_store.get(("merchant", merchant_id)) if merchant_id else None
     merchant = merchant_entry["payload"] if merchant_entry else {}
 
@@ -351,13 +391,31 @@ async def reply(body: ReplyBody):
             customer=customer,
             trigger_kind=trigger_kind,
             trigger_payload=trigger_payload,
-            merchant_id=merchant_id
+            merchant_id=merchant_id,
+            is_customer_message=is_customer_message
         )
     except Exception as e:
         log.error(f"Reply handler failed: {e}")
+        if is_customer_message:
+            # Customer-specific fallback
+            cust_name = ""
+            if customer:
+                cust_name = customer.get("identity", {}).get("name", "")
+            fallback_body = (
+                f"Hi {cust_name}! Thank you for confirming. Your appointment is all set — "
+                f"we look forward to seeing you!"
+                if cust_name else
+                "Thank you for confirming! Your appointment is all set. See you soon!"
+            )
+            return {
+                "action": "send",
+                "body": fallback_body,
+                "cta": "confirm",
+                "rationale": "Customer confirmation fallback"
+            }
         return {
             "action": "send",
-            "body": "Got it! Let me work on this for you.",
+            "body": "On it! Let me pull that together for you.",
             "cta": "open_ended",
             "rationale": "Fallback response due to processing error"
         }
@@ -400,6 +458,7 @@ async def teardown():
     conv_meta.clear()
     suppression_log.clear()
     sent_bodies.clear()
+    auto_reply_counts.clear()
     log.info("State wiped on teardown")
     return {"status": "cleared"}
 
@@ -830,12 +889,13 @@ async def handle_reply_with_llm(
     customer: Optional[dict],
     trigger_kind: str,
     trigger_payload: dict,
-    merchant_id: str
+    merchant_id: str,
+    is_customer_message: bool = False
 ) -> dict:
     """
     Handles a merchant/customer reply using LLM intent classification + response composition.
+    If is_customer_message=True, composes a customer-voiced reply addressed to the customer.
     """
-    # Build conversation context
     history_str = "\n".join([
         f"  [{t.get('from','?').upper()} turn {t.get('turn_number','?')}]: {t.get('body','')[:200]}"
         for t in conversation_history[-5:]
@@ -844,14 +904,61 @@ async def handle_reply_with_llm(
     merch_summary = summarize_merchant(merchant)
     cat_summary = summarize_category(category) if category else "Category: not available"
     cust_summary = summarize_customer(customer) if customer else ""
-
-    # Key context for the reply handler: what did the bot last say?
     digest_items = category.get("digest", []) if category else []
     digest_str = "\n".join([
         f"  [{d.get('kind')}] {d.get('title')}: {d.get('summary','')[:150]}"
         for d in digest_items[:3]
     ])
 
+    # ── CUSTOMER MESSAGE: compose customer-voiced reply ──────────────────────
+    if is_customer_message:
+        cust_name = ""
+        cust_lang = "english"
+        slot_picked = ""
+        if customer:
+            cust_name = customer.get("identity", {}).get("name", "")
+            cust_lang = customer.get("identity", {}).get("language_pref", "english")
+        # Try to detect slot selection from message
+        if any(x in message.lower() for x in ["wed", "thu", "sat", "6pm", "7pm", "8am", "yes", "book", "confirm"]):
+            slot_picked = message
+
+        customer_system = """You are Vera, composing a message FROM the merchant TO their customer.
+The customer just replied. Compose a warm, helpful response addressed directly to the customer by name.
+- Confirm their booking/request if they accepted
+- Use their language preference
+- Be brief, warm, specific
+- End with one clear next step
+Output ONLY valid JSON: {"body": "...", "cta": "confirm|open_ended", "send_as": "merchant_on_behalf", "rationale": "..."}"""
+
+        customer_prompt = f"""Customer replied to a merchant message.
+
+CUSTOMER: {cust_name} | Language: {cust_lang} | State: {customer.get('state','') if customer else ''}
+MERCHANT: {merchant.get('identity',{}).get('name','')} | Owner: {merchant.get('identity',{}).get('owner_first_name','')}
+TRIGGER KIND: {trigger_kind}
+LAST BOT MESSAGE: "{last_bot_body}"
+CUSTOMER MESSAGE: "{message}"
+CUSTOMER CONTEXT: {cust_summary[:400]}
+
+Compose a reply FROM the merchant addressed TO the customer {cust_name}.
+If they picked a slot or said yes: confirm the booking with specific details.
+Output ONLY the JSON."""
+
+        response_text = await call_claude(customer_system, customer_prompt, COMPOSE_MODEL, temperature=0.0)
+        result = parse_json_response(response_text)
+        if result and result.get("body"):
+            result["action"] = "send"
+            return result
+        # Fallback for customer
+        confirm_body = f"Hi {cust_name}! Your appointment is confirmed. We look forward to seeing you. Please call us if anything changes." if cust_name else "Your appointment is confirmed! We look forward to seeing you."
+        return {
+            "intent": "accept",
+            "action": "send",
+            "body": confirm_body,
+            "cta": "confirm",
+            "rationale": "Customer accepted/confirmed — booking confirmed response"
+        }
+
+    # ── MERCHANT MESSAGE: standard intent classification ──────────────────────
     user_prompt = f"""Merchant/customer just replied. Handle it correctly.
 
 CONVERSATION HISTORY (last 5 turns):
@@ -864,7 +971,7 @@ NEW REPLY (turn {turn_number}):
 From: {from_role}
 Message: "{message}"
 
-TRIGGER KIND (what started this conversation): {trigger_kind}
+TRIGGER KIND: {trigger_kind}
 TRIGGER PAYLOAD: {json.dumps(trigger_payload, ensure_ascii=False)[:300]}
 
 MERCHANT CONTEXT:
@@ -876,12 +983,12 @@ CATEGORY DIGEST (use for content if merchant accepts):
 {cust_summary[:300] if cust_summary else ""}
 
 TASK:
-1. Classify the intent of "{message}"
-2. If accept: draft the actual deliverable promised in the last bot message (using real context data)
-3. If decline: close gracefully
-4. If question: answer from context, re-offer CTA
-5. If off_topic: acknowledge briefly, return to topic
-6. If hostile: end immediately
+1. Classify intent of "{message}"
+2. accept → deliver the exact promised artifact using real context data
+3. decline → graceful close
+4. question → answer from context, re-offer CTA
+5. off_topic → acknowledge briefly, return to topic
+6. hostile → end immediately
 
 Output ONLY the JSON object."""
 
@@ -889,28 +996,20 @@ Output ONLY the JSON object."""
     result = parse_json_response(response_text)
 
     if not result:
-        # Safe fallback
         msg_lower = message.lower()
         if any(w in msg_lower for w in ["yes", "sure", "ok", "go", "haan", "karo", "confirm"]):
             return {
-                "intent": "accept",
-                "action": "send",
-                "body": "Sending it over now — I'll have it ready in a moment. Let me know if you'd like any changes.",
-                "cta": "open_ended",
-                "wait_seconds": 0,
-                "rationale": "Fallback accept response"
+                "intent": "accept", "action": "send",
+                "body": "On it — sending the draft now. Let me know if you'd like any changes.",
+                "cta": "open_ended", "wait_seconds": 0, "rationale": "Fallback accept"
             }
         return {
-            "intent": "unclear",
-            "action": "send",
-            "body": "Got it! Should I go ahead with what we discussed? Reply YES to confirm or let me know if you'd like to adjust anything.",
-            "cta": "yes_no",
-            "wait_seconds": 0,
-            "rationale": "Fallback unclear response"
+            "intent": "unclear", "action": "send",
+            "body": "Should I go ahead? Reply YES to confirm.",
+            "cta": "yes_no", "wait_seconds": 0, "rationale": "Fallback unclear"
         }
     return result
 
-# ─────────────────────────────────────────────────────────────────────────────
 # JSON PARSER  (handles LLM sometimes wrapping in markdown)
 # ─────────────────────────────────────────────────────────────────────────────
 
