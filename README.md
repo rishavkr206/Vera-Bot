@@ -23,6 +23,8 @@ bot.py                     # Single-file FastAPI application
 └── Reply Handler          # Intent FSM: accept/decline/hostile/auto-reply/question/off-topic
 ```
 
+
+
 ## Reply Handler States
 
 ```
